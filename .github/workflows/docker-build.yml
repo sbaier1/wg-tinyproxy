@@ -6,8 +6,7 @@ on:
   pull_request:
     branches: [main]
   release:
-    types: [created]
-
+    types: [published]
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -41,8 +40,8 @@ jobs:
             type=ref,event=branch
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ github.event.release.tag_name }},enable={{is_release}}
-
+            type=semver,pattern={{version}},event=tag
+            type=semver,pattern={{major}}.{{minor}},event=tag
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
