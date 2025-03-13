@@ -50,11 +50,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	listenPort := getEnvOrDefault("WG_LISTEN_PORT", "58120")
 	keepAlive := getEnvOrDefault("WG_KEEPALIVE", "25")
 
 	// Get proxy configuration
-	localAddrStr, err := getRequiredEnv("LOCAL_IP")
+	localAddrStr, err := getRequiredEnv("WG_ADDRESS")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -74,7 +73,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// We won't be makign any DNS queries, we only listen on the tunnel
+	// We won't be making any DNS queries, we only listen on the tunnel
 	dnsServers := []netip.Addr{}
 
 	// Create the WireGuard TUN device with netstack
@@ -92,12 +91,11 @@ func main() {
 
 	// Configure WireGuard using IPC
 	wgConfig := fmt.Sprintf(`private_key=%s
-listen_port=%s
 public_key=%s
 allowed_ip=%s
 persistent_keepalive_interval=%s
 endpoint=%s
-`, privateKey, listenPort, publicKey, allowedIP, keepAlive, endpoint)
+`, privateKey, publicKey, allowedIP, keepAlive, endpoint)
 
 	err = dev.IpcSet(wgConfig)
 	if err != nil {
