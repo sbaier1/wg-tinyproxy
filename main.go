@@ -5,13 +5,20 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"strconv"
+	"sync"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
+)
+
+var (
+	proxyReady    = false
+	tunnelUpMutex = sync.Mutex{}
 )
 
 func getEnvOrDefault(key, defaultValue string) string {
@@ -26,6 +33,24 @@ func getRequiredEnv(key string) (string, error) {
 		return value, nil
 	}
 	return "", fmt.Errorf("required environment variable %s is not set", key)
+}
+
+func startHealthCheckListener(port string) {
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		tunnelUpMutex.Lock()
+		defer tunnelUpMutex.Unlock()
+		if proxyReady {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+		} else {
+			http.Error(w, "WireGuard tunnel is down", http.StatusServiceUnavailable)
+		}
+	})
+
+	log.Printf("Health check listener started on :%s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Failed to start health check listener: %v", err)
+	}
 }
 
 func main() {
@@ -73,7 +98,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// We won't be making any DNS queries, we only listen on the tunnel
+	healthPort := getEnvOrDefault("HEALTH_PORT", "")
+
+	// Start health check listener if HEALTH_PORT is set
+	if healthPort != "" {
+		go startHealthCheckListener(healthPort)
+	}
+
+	// We won't be makign any DNS queries, we only listen on the tunnel
 	dnsServers := []netip.Addr{}
 
 	// Create the WireGuard TUN device with netstack
@@ -119,6 +151,7 @@ endpoint=%s
 	if err != nil {
 		log.Fatal("Failed to listen on port:", err)
 	}
+	proxyReady = true
 	log.Printf("TCP proxy listening on %s:%s", localAddrStr, localPort)
 	log.Printf("Forwarding to %s:%s", targetAddrStr, targetPort)
 
