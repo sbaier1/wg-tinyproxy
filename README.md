@@ -35,4 +35,27 @@ TARGET_HOST
 TARGET_PORT
 ```
 
+Optional conf:
+
+```shell
+# healthcheck port, will provide a /health endpoint for readiness (or startup probe) checking (no continuous liveness check)
+HEALTH_PORT
+```
+
+Can be used like this:
+
+```yaml
+env:
+  - name: HEALTH_PORT
+    value: "9091"
+readinessProbe:
+  httpGet:
+    port: 9091
+    path: /health
+  successThreshold: 1
+  failureThreshold: 20
+```
+
+### wg config conversion
+
 There's a small script [here](wg_conf_to_env.sh) that will convert a typical wg.conf into an env mapping as expected by the tool.
