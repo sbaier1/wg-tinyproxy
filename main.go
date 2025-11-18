@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -121,13 +123,26 @@ func main() {
 	// Create and configure the WireGuard device
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "wireguard: "))
 
+	// Convert base64 keys to hex for WireGuard IPC
+	privateKeyBytes, err := base64.StdEncoding.DecodeString(privateKey)
+	if err != nil {
+		log.Fatal("Failed to decode private key:", err)
+	}
+	privateKeyHex := hex.EncodeToString(privateKeyBytes)
+
+	publicKeyBytes, err := base64.StdEncoding.DecodeString(publicKey)
+	if err != nil {
+		log.Fatal("Failed to decode public key:", err)
+	}
+	publicKeyHex := hex.EncodeToString(publicKeyBytes)
+
 	// Configure WireGuard using IPC
 	wgConfig := fmt.Sprintf(`private_key=%s
 public_key=%s
 allowed_ip=%s
 persistent_keepalive_interval=%s
 endpoint=%s
-`, privateKey, publicKey, allowedIP, keepAlive, endpoint)
+`, privateKeyHex, publicKeyHex, allowedIP, keepAlive, endpoint)
 
 	err = dev.IpcSet(wgConfig)
 	if err != nil {
