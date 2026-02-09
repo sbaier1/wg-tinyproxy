@@ -40,6 +40,8 @@ Optional conf:
 ```shell
 # healthcheck port, will provide a /health endpoint for readiness (or startup probe) checking (no continuous liveness check)
 HEALTH_PORT
+# MTU for the WireGuard interface (default: 1420)
+WG_MTU
 ```
 
 Can be used like this:

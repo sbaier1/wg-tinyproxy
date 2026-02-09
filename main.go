@@ -101,6 +101,13 @@ func main() {
 	}
 
 	healthPort := getEnvOrDefault("HEALTH_PORT", "")
+	mtu := getEnvOrDefault("WG_MTU", "1420")
+
+	// Parse MTU
+	mtuInt, err := strconv.Atoi(mtu)
+	if err != nil {
+		log.Fatal("Invalid MTU value:", err)
+	}
 
 	// Start health check listener if HEALTH_PORT is set
 	if healthPort != "" {
@@ -114,7 +121,7 @@ func main() {
 	tun, tnet, err := netstack.CreateNetTUN(
 		[]netip.Addr{netip.MustParseAddr(localAddrStr)},
 		dnsServers,
-		1420,
+		mtuInt,
 	)
 	if err != nil {
 		log.Fatal("Failed to create TUN device:", err)
