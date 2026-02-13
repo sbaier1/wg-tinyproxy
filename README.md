@@ -2,6 +2,8 @@
 
 A super simple wireguard proxy that uses the wireguard-go userspace implementation.
 
+A bit like socat but completely userspace and only intended for a simple point-to-point `tcp->wg->VPN->wg->tcp` connection.
+
 The main use-case for this tool is to allow exposing individual downstream services within a Wireguard network.
 
 By leveraging a userspace implementation and proxying directly from that userspace implementation, we can expose services within the confines of a container, allowing us to just run this as a regular, very small sidecar container, without running as root and without adding `NET_ADMIN` capabilities.
@@ -42,20 +44,72 @@ Optional conf:
 HEALTH_PORT
 # MTU for the WireGuard interface (default: 1420)
 WG_MTU
+# Proxy mode: "egress" (default) or "ingress"
+PROXY_MODE
+# Listen address for ingress mode (default: 0.0.0.0)
+LISTEN_ADDR
 ```
 
-Can be used like this:
+## Proxy Modes
+
+### Egress (default)
+
+Listens on the WireGuard tunnel and forwards to the regular network. Use this when you want to expose a service from outside the tunnel to clients inside the tunnel.
+
+```
+[WG tunnel] --> [wg-tinyproxy] --> [TARGET_HOST:TARGET_PORT]
+```
+
+### Ingress
+
+Listens on the regular network and forwards through the WireGuard tunnel. Use this when you want to expose a service inside the tunnel to clients outside.
+
+```
+[LISTEN_ADDR:LOCAL_PORT] --> [wg-tinyproxy] --> [WG tunnel] --> [TARGET_HOST:TARGET_PORT]
+```
+
+Example:
+```shell
+PROXY_MODE=ingress
+LISTEN_ADDR=0.0.0.0
+LOCAL_PORT=8080
+TARGET_HOST=10.0.0.5
+TARGET_PORT=80
+```
+
+## Health Check
+
+The `/health` endpoint supports different validation modes via query parameters:
+
+| Mode | URL | Description |
+|------|-----|-------------|
+| Default | `/health` | Checks if proxy is ready (startup check only) |
+| TCP | `/health?mode=tcp` | TCP connect to target through tunnel |
+| HTTP | `/health?mode=http&path=/healthz` | HTTP GET to target through tunnel |
+
+Additional parameters:
+- `timeout` - connection timeout (default: `5s`), e.g. `timeout=3s`
+
+### Kubernetes examples
 
 ```yaml
-env:
-  - name: HEALTH_PORT
-    value: "9091"
+# Default (startup only)
 readinessProbe:
   httpGet:
     port: 9091
     path: /health
-  successThreshold: 1
-  failureThreshold: 20
+
+# TCP validation through tunnel
+readinessProbe:
+  httpGet:
+    port: 9091
+    path: /health?mode=tcp
+
+# HTTP validation through tunnel
+readinessProbe:
+  httpGet:
+    port: 9091
+    path: /health?mode=http&path=/healthz
 ```
 
 ### wg config conversion

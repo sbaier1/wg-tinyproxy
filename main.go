@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -21,6 +23,11 @@ import (
 var (
 	proxyReady    = false
 	tunnelUpMutex = sync.Mutex{}
+
+	// Health check dependencies (set after tunnel is up)
+	healthTnet       *netstack.Net
+	healthTargetHost string
+	healthTargetPort string
 )
 
 func getEnvOrDefault(key, defaultValue string) string {
@@ -37,15 +44,95 @@ func getRequiredEnv(key string) (string, error) {
 	return "", fmt.Errorf("required environment variable %s is not set", key)
 }
 
+func checkTCP(timeout time.Duration) error {
+	if healthTnet == nil {
+		return fmt.Errorf("tunnel not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	addr := net.JoinHostPort(healthTargetHost, healthTargetPort)
+	conn, err := healthTnet.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("TCP connect failed: %w", err)
+	}
+	conn.Close()
+	return nil
+}
+
+func checkHTTP(path string, timeout time.Duration) error {
+	if healthTnet == nil {
+		return fmt.Errorf("tunnel not initialized")
+	}
+
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: healthTnet.DialContext,
+		},
+	}
+
+	url := fmt.Sprintf("http://%s:%s%s", healthTargetHost, healthTargetPort, path)
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func startHealthCheckListener(port string) {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		tunnelUpMutex.Lock()
-		defer tunnelUpMutex.Unlock()
-		if proxyReady {
+		ready := proxyReady
+		tunnelUpMutex.Unlock()
+
+		if !ready {
+			http.Error(w, "WireGuard tunnel is down", http.StatusServiceUnavailable)
+			return
+		}
+
+		mode := r.URL.Query().Get("mode")
+		timeoutStr := r.URL.Query().Get("timeout")
+		timeout := 5 * time.Second
+		if timeoutStr != "" {
+			if d, err := time.ParseDuration(timeoutStr); err == nil {
+				timeout = d
+			}
+		}
+
+		switch mode {
+		case "tcp":
+			if err := checkTCP(timeout); err != nil {
+				log.Printf("Health check (tcp) failed: %v", err)
+				http.Error(w, fmt.Sprintf("TCP check failed: %v", err), http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK (tcp)"))
+
+		case "http":
+			path := r.URL.Query().Get("path")
+			if path == "" {
+				path = "/"
+			}
+			if err := checkHTTP(path, timeout); err != nil {
+				log.Printf("Health check (http) failed: %v", err)
+				http.Error(w, fmt.Sprintf("HTTP check failed: %v", err), http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK (http)"))
+
+		default:
+			// Default: just check if proxy is ready (original behavior)
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("OK"))
-		} else {
-			http.Error(w, "WireGuard tunnel is down", http.StatusServiceUnavailable)
 		}
 	})
 
@@ -102,6 +189,8 @@ func main() {
 
 	healthPort := getEnvOrDefault("HEALTH_PORT", "")
 	mtu := getEnvOrDefault("WG_MTU", "1420")
+	proxyMode := getEnvOrDefault("PROXY_MODE", "egress")
+	listenAddr := getEnvOrDefault("LISTEN_ADDR", "0.0.0.0")
 
 	// Parse MTU
 	mtuInt, err := strconv.Atoi(mtu)
@@ -168,32 +257,62 @@ endpoint=%s
 		log.Fatal("Invalid local port:", err)
 	}
 
-	// Start TCP listener
-	listener, err := tnet.ListenTCP(&net.TCPAddr{Port: listenPortInt})
-	if err != nil {
-		log.Fatal("Failed to listen on port:", err)
-	}
-	proxyReady = true
-	log.Printf("TCP proxy listening on %s:%s", localAddrStr, localPort)
-	log.Printf("Forwarding to %s:%s", targetAddrStr, targetPort)
+	// Set health check dependencies
+	healthTnet = tnet
+	healthTargetHost = targetAddrStr
+	healthTargetPort = targetPort
 
-	// Accept and handle connections
-	for {
-		conn, err := listener.Accept()
+	switch proxyMode {
+	case "egress":
+		// Egress mode: listen on tunnel, forward to regular network
+		listener, err := tnet.ListenTCP(&net.TCPAddr{Port: listenPortInt})
 		if err != nil {
-			log.Printf("Failed to accept connection: %v", err)
-			continue
+			log.Fatal("Failed to listen on tunnel port:", err)
 		}
 
-		// Handle each connection in a separate goroutine
-		go handleConnection(conn, targetAddrStr, targetPort)
+		proxyReady = true
+		log.Printf("TCP proxy (egress) listening on tunnel %s:%s", localAddrStr, localPort)
+		log.Printf("Forwarding to %s:%s", targetAddrStr, targetPort)
+
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				log.Printf("Failed to accept connection: %v", err)
+				continue
+			}
+			go handleEgressConnection(conn, targetAddrStr, targetPort)
+		}
+
+	case "ingress":
+		// Ingress mode: listen on regular network, forward through tunnel
+		listenAddress := net.JoinHostPort(listenAddr, localPort)
+		listener, err := net.Listen("tcp", listenAddress)
+		if err != nil {
+			log.Fatal("Failed to listen on address:", err)
+		}
+
+		proxyReady = true
+		log.Printf("TCP proxy (ingress) listening on %s", listenAddress)
+		log.Printf("Forwarding to %s:%s via tunnel", targetAddrStr, targetPort)
+
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				log.Printf("Failed to accept connection: %v", err)
+				continue
+			}
+			go handleIngressConnection(conn, targetAddrStr, targetPort, tnet)
+		}
+
+	default:
+		log.Fatalf("Invalid PROXY_MODE: %s (must be 'egress' or 'ingress')", proxyMode)
 	}
 }
 
-func handleConnection(clientConn net.Conn, targetHost, targetPort string) {
+func handleEgressConnection(clientConn net.Conn, targetHost, targetPort string) {
 	defer clientConn.Close()
 
-	// Connect to the target
+	// Connect to the target via regular network
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
 	targetConn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
@@ -203,8 +322,26 @@ func handleConnection(clientConn net.Conn, targetHost, targetPort string) {
 	defer targetConn.Close()
 
 	log.Printf("Proxying connection from %s to %s", clientConn.RemoteAddr(), targetAddr)
+	proxyData(clientConn, targetConn)
+}
 
-	// Copy data in both directions simultaneously
+func handleIngressConnection(clientConn net.Conn, targetHost, targetPort string, tnet *netstack.Net) {
+	defer clientConn.Close()
+
+	// Connect to the target via WireGuard tunnel
+	targetAddr := net.JoinHostPort(targetHost, targetPort)
+	targetConn, err := tnet.Dial("tcp", targetAddr)
+	if err != nil {
+		log.Printf("Failed to connect to target %s via tunnel: %v", targetAddr, err)
+		return
+	}
+	defer targetConn.Close()
+
+	log.Printf("Proxying connection from %s to %s (via tunnel)", clientConn.RemoteAddr(), targetAddr)
+	proxyData(clientConn, targetConn)
+}
+
+func proxyData(clientConn, targetConn net.Conn) {
 	errCh := make(chan error, 2)
 
 	go func() {
@@ -218,7 +355,7 @@ func handleConnection(clientConn net.Conn, targetHost, targetPort string) {
 	}()
 
 	// Wait for either direction to close
-	err = <-errCh
+	err := <-errCh
 	if err != nil && err != io.EOF {
 		log.Printf("Connection error: %v", err)
 	}
