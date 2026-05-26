@@ -2,6 +2,8 @@
 
 A super simple wireguard proxy that uses the wireguard-go userspace implementation.
 
+A bit like socat but completely userspace and only intended for a simple point-to-point `tcp->wg->VPN->wg->tcp` connection.
+
 The main use-case for this tool is to allow exposing individual downstream services within a Wireguard network.
 
 By leveraging a userspace implementation and proxying directly from that userspace implementation, we can expose services within the confines of a container, allowing us to just run this as a regular, very small sidecar container, without running as root and without adding `NET_ADMIN` capabilities.
@@ -28,11 +30,20 @@ WG_ALLOWED_IP
 WG_ENDPOINT
 # PersistentKeepalive
 WG_KEEPALIVE
-# local bind port
-LOCAL_PORT
-# target host+port to proxy to
+# target host to proxy to
 TARGET_HOST
-TARGET_PORT
+```
+
+Port configuration (one of the following):
+
+```shell
+# Option 1: Multiple port mappings (recommended)
+# Format: "listen:target,listen:target,..." or just "port" for same-port mapping
+PORT_MAPPINGS=8080:8080,50051:50051,1023:1080
+
+# Option 2: Legacy single port (backwards compatible)
+LOCAL_PORT=8080
+TARGET_PORT=8080
 ```
 
 Optional conf:
@@ -42,20 +53,89 @@ Optional conf:
 HEALTH_PORT
 # MTU for the WireGuard interface (default: 1420)
 WG_MTU
+# Proxy mode: "egress" (default) or "ingress"
+PROXY_MODE
+# Listen address for ingress mode (default: 0.0.0.0)
+LISTEN_ADDR
 ```
 
-Can be used like this:
+## Port Mappings
+
+The `PORT_MAPPINGS` variable accepts a comma-separated list of port mappings:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| `listen:target` | `8080:80` | Listen on 8080, forward to 80 |
+| `port` | `8080` | Same as `8080:8080` |
+| Multiple | `8080:80,443:443,9090` | Multiple mappings |
+
+Example:
+```shell
+# Forward HTTP, gRPC, and metrics
+PORT_MAPPINGS=8080:80,50051:50051,9090:9090
+TARGET_HOST=10.0.0.5
+```
+
+## Proxy Modes
+
+### Egress (default)
+
+Listens on the WireGuard tunnel and forwards to the regular network. Use this when you want to expose a service from outside the tunnel to clients inside the tunnel.
+
+```
+[WG tunnel] --> [wg-tinyproxy] --> [TARGET_HOST:TARGET_PORT]
+```
+
+### Ingress
+
+Listens on the regular network and forwards through the WireGuard tunnel. Use this when you want to expose a service inside the tunnel to clients outside.
+
+```
+[LISTEN_ADDR:LOCAL_PORT] --> [wg-tinyproxy] --> [WG tunnel] --> [TARGET_HOST:TARGET_PORT]
+```
+
+Example:
+```shell
+PROXY_MODE=ingress
+LISTEN_ADDR=0.0.0.0
+LOCAL_PORT=8080
+TARGET_HOST=10.0.0.5
+TARGET_PORT=80
+```
+
+## Health Check
+
+The `/health` endpoint supports different validation modes via query parameters:
+
+| Mode | URL | Description |
+|------|-----|-------------|
+| Default | `/health` | Checks if proxy is ready (startup check only) |
+| TCP | `/health?mode=tcp` | TCP connect to target through tunnel |
+| HTTP | `/health?mode=http&path=/healthz` | HTTP GET to target through tunnel |
+
+Additional parameters:
+- `timeout` - connection timeout (default: `5s`), e.g. `timeout=3s`
+
+### Kubernetes examples
 
 ```yaml
-env:
-  - name: HEALTH_PORT
-    value: "9091"
+# Default (startup only)
 readinessProbe:
   httpGet:
     port: 9091
     path: /health
-  successThreshold: 1
-  failureThreshold: 20
+
+# TCP validation through tunnel
+readinessProbe:
+  httpGet:
+    port: 9091
+    path: /health?mode=tcp
+
+# HTTP validation through tunnel
+readinessProbe:
+  httpGet:
+    port: 9091
+    path: /health?mode=http&path=/healthz
 ```
 
 ### wg config conversion
