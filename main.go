@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,15 +21,109 @@ import (
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
+// PortMapping represents a single port forwarding rule
+type PortMapping struct {
+	ListenPort int
+	TargetPort int
+}
+
+// parsePortMappings parses a comma-separated list of port mappings in format "src:dst,src:dst"
+// If a single number is provided (e.g., "8080"), it maps to the same port (8080:8080)
+func parsePortMappings(mappings string) ([]PortMapping, error) {
+	var result []PortMapping
+	for _, mapping := range strings.Split(mappings, ",") {
+		mapping = strings.TrimSpace(mapping)
+		if mapping == "" {
+			continue
+		}
+
+		parts := strings.Split(mapping, ":")
+		var listenPort, targetPort int
+		var err error
+
+		switch len(parts) {
+		case 1:
+			// Single port: use same port for both
+			listenPort, err = strconv.Atoi(parts[0])
+			if err != nil {
+				return nil, fmt.Errorf("invalid port %q: %w", parts[0], err)
+			}
+			targetPort = listenPort
+		case 2:
+			listenPort, err = strconv.Atoi(parts[0])
+			if err != nil {
+				return nil, fmt.Errorf("invalid listen port %q: %w", parts[0], err)
+			}
+			targetPort, err = strconv.Atoi(parts[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid target port %q: %w", parts[1], err)
+			}
+		default:
+			return nil, fmt.Errorf("invalid port mapping %q: expected format 'listen:target' or 'port'", mapping)
+		}
+
+		result = append(result, PortMapping{ListenPort: listenPort, TargetPort: targetPort})
+	}
+
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no valid port mappings found")
+	}
+
+	return result, nil
+}
+
 var (
 	proxyReady    = false
 	tunnelUpMutex = sync.Mutex{}
 
 	// Health check dependencies (set after tunnel is up)
 	healthTnet       *netstack.Net
+	healthDev        *device.Device
 	healthTargetHost string
 	healthTargetPort string
 )
+
+// checkTunnel verifies the WireGuard tunnel has a recent handshake with the peer.
+// maxAge is the oldest acceptable handshake age. WireGuard rekeys every ~2min, so
+// a handshake older than ~3min indicates the tunnel is wedged or the peer is gone.
+func checkTunnel(maxAge time.Duration) error {
+	if healthDev == nil {
+		return fmt.Errorf("tunnel not initialized")
+	}
+
+	cfg, err := healthDev.IpcGet()
+	if err != nil {
+		return fmt.Errorf("IpcGet failed: %w", err)
+	}
+
+	var sec, nsec int64
+	var sawPeer bool
+	for _, line := range strings.Split(cfg, "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "public_key":
+			sawPeer = true
+		case "last_handshake_time_sec":
+			sec, _ = strconv.ParseInt(v, 10, 64)
+		case "last_handshake_time_nsec":
+			nsec, _ = strconv.ParseInt(v, 10, 64)
+		}
+	}
+	if !sawPeer {
+		return fmt.Errorf("no peer configured")
+	}
+	if sec == 0 && nsec == 0 {
+		return fmt.Errorf("no handshake yet")
+	}
+	age := time.Since(time.Unix(sec, nsec))
+	if age > maxAge {
+		return fmt.Errorf("last handshake %s ago (max %s)", age.Truncate(time.Second), maxAge)
+	}
+	return nil
+}
 
 func getEnvOrDefault(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
@@ -116,6 +211,21 @@ func startHealthCheckListener(port string) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("OK (tcp)"))
 
+		case "tunnel":
+			maxAge := 3 * time.Minute
+			if s := r.URL.Query().Get("max_age"); s != "" {
+				if d, err := time.ParseDuration(s); err == nil {
+					maxAge = d
+				}
+			}
+			if err := checkTunnel(maxAge); err != nil {
+				log.Printf("Health check (tunnel) failed: %v", err)
+				http.Error(w, fmt.Sprintf("Tunnel check failed: %v", err), http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK (tunnel)"))
+
 		case "http":
 			path := r.URL.Query().Get("path")
 			if path == "" {
@@ -172,19 +282,37 @@ func main() {
 		log.Fatal(err)
 	}
 
-	localPort, err := getRequiredEnv("LOCAL_PORT")
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	targetAddrStr, err := getRequiredEnv("TARGET_HOST")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	targetPort, err := getRequiredEnv("TARGET_PORT")
-	if err != nil {
-		log.Fatal(err)
+	// Parse port mappings: either PORT_MAPPINGS or legacy LOCAL_PORT/TARGET_PORT
+	var portMappings []PortMapping
+	if mappingsStr := getEnvOrDefault("PORT_MAPPINGS", ""); mappingsStr != "" {
+		portMappings, err = parsePortMappings(mappingsStr)
+		if err != nil {
+			log.Fatalf("Invalid PORT_MAPPINGS: %v", err)
+		}
+	} else {
+		// Legacy single-port mode
+		localPort, err := getRequiredEnv("LOCAL_PORT")
+		if err != nil {
+			log.Fatal(err)
+		}
+		targetPort, err := getRequiredEnv("TARGET_PORT")
+		if err != nil {
+			log.Fatal(err)
+		}
+		listenPortInt, err := strconv.Atoi(localPort)
+		if err != nil {
+			log.Fatal("Invalid LOCAL_PORT:", err)
+		}
+		targetPortInt, err := strconv.Atoi(targetPort)
+		if err != nil {
+			log.Fatal("Invalid TARGET_PORT:", err)
+		}
+		portMappings = []PortMapping{{ListenPort: listenPortInt, TargetPort: targetPortInt}}
 	}
 
 	healthPort := getEnvOrDefault("HEALTH_PORT", "")
@@ -251,61 +379,71 @@ endpoint=%s
 		log.Fatal("Failed to bring up WireGuard interface:", err)
 	}
 
-	// Parse listen port
-	listenPortInt, err := strconv.Atoi(localPort)
-	if err != nil {
-		log.Fatal("Invalid local port:", err)
+	// Set health check dependencies (use first mapping for health check target)
+	healthTnet = tnet
+	healthDev = dev
+	healthTargetHost = targetAddrStr
+	healthTargetPort = strconv.Itoa(portMappings[0].TargetPort)
+
+	// Validate proxy mode
+	if proxyMode != "egress" && proxyMode != "ingress" {
+		log.Fatalf("Invalid PROXY_MODE: %s (must be 'egress' or 'ingress')", proxyMode)
 	}
 
-	// Set health check dependencies
-	healthTnet = tnet
-	healthTargetHost = targetAddrStr
-	healthTargetPort = targetPort
-
-	switch proxyMode {
-	case "egress":
-		// Egress mode: listen on tunnel, forward to regular network
-		listener, err := tnet.ListenTCP(&net.TCPAddr{Port: listenPortInt})
-		if err != nil {
-			log.Fatal("Failed to listen on tunnel port:", err)
-		}
-
-		proxyReady = true
-		log.Printf("TCP proxy (egress) listening on tunnel %s:%s", localAddrStr, localPort)
-		log.Printf("Forwarding to %s:%s", targetAddrStr, targetPort)
-
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				log.Printf("Failed to accept connection: %v", err)
-				continue
+	// Start listeners for each port mapping
+	var wg sync.WaitGroup
+	for _, mapping := range portMappings {
+		wg.Add(1)
+		go func(m PortMapping) {
+			defer wg.Done()
+			switch proxyMode {
+			case "egress":
+				runEgressListener(tnet, localAddrStr, targetAddrStr, m)
+			case "ingress":
+				runIngressListener(tnet, listenAddr, targetAddrStr, m)
 			}
-			go handleEgressConnection(conn, targetAddrStr, targetPort)
-		}
+		}(mapping)
+	}
 
-	case "ingress":
-		// Ingress mode: listen on regular network, forward through tunnel
-		listenAddress := net.JoinHostPort(listenAddr, localPort)
-		listener, err := net.Listen("tcp", listenAddress)
+	proxyReady = true
+	log.Printf("TCP proxy (%s) started with %d port mapping(s)", proxyMode, len(portMappings))
+	wg.Wait()
+}
+
+func runEgressListener(tnet *netstack.Net, localAddr, targetHost string, mapping PortMapping) {
+	listener, err := tnet.ListenTCP(&net.TCPAddr{Port: mapping.ListenPort})
+	if err != nil {
+		log.Fatalf("Failed to listen on tunnel port %d: %v", mapping.ListenPort, err)
+	}
+
+	log.Printf("  [egress] %s:%d -> %s:%d", localAddr, mapping.ListenPort, targetHost, mapping.TargetPort)
+
+	for {
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Fatal("Failed to listen on address:", err)
+			log.Printf("Failed to accept connection on port %d: %v", mapping.ListenPort, err)
+			continue
 		}
+		go handleEgressConnection(conn, targetHost, strconv.Itoa(mapping.TargetPort))
+	}
+}
 
-		proxyReady = true
-		log.Printf("TCP proxy (ingress) listening on %s", listenAddress)
-		log.Printf("Forwarding to %s:%s via tunnel", targetAddrStr, targetPort)
+func runIngressListener(tnet *netstack.Net, listenAddr, targetHost string, mapping PortMapping) {
+	listenAddress := net.JoinHostPort(listenAddr, strconv.Itoa(mapping.ListenPort))
+	listener, err := net.Listen("tcp", listenAddress)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", listenAddress, err)
+	}
 
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				log.Printf("Failed to accept connection: %v", err)
-				continue
-			}
-			go handleIngressConnection(conn, targetAddrStr, targetPort, tnet)
+	log.Printf("  [ingress] %s -> %s:%d (via tunnel)", listenAddress, targetHost, mapping.TargetPort)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Failed to accept connection on %s: %v", listenAddress, err)
+			continue
 		}
-
-	default:
-		log.Fatalf("Invalid PROXY_MODE: %s (must be 'egress' or 'ingress')", proxyMode)
+		go handleIngressConnection(conn, targetHost, strconv.Itoa(mapping.TargetPort), tnet)
 	}
 }
 

@@ -30,11 +30,20 @@ WG_ALLOWED_IP
 WG_ENDPOINT
 # PersistentKeepalive
 WG_KEEPALIVE
-# local bind port
-LOCAL_PORT
-# target host+port to proxy to
+# target host to proxy to
 TARGET_HOST
-TARGET_PORT
+```
+
+Port configuration (one of the following):
+
+```shell
+# Option 1: Multiple port mappings (recommended)
+# Format: "listen:target,listen:target,..." or just "port" for same-port mapping
+PORT_MAPPINGS=8080:8080,50051:50051,1023:1080
+
+# Option 2: Legacy single port (backwards compatible)
+LOCAL_PORT=8080
+TARGET_PORT=8080
 ```
 
 Optional conf:
@@ -48,6 +57,23 @@ WG_MTU
 PROXY_MODE
 # Listen address for ingress mode (default: 0.0.0.0)
 LISTEN_ADDR
+```
+
+## Port Mappings
+
+The `PORT_MAPPINGS` variable accepts a comma-separated list of port mappings:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| `listen:target` | `8080:80` | Listen on 8080, forward to 80 |
+| `port` | `8080` | Same as `8080:8080` |
+| Multiple | `8080:80,443:443,9090` | Multiple mappings |
+
+Example:
+```shell
+# Forward HTTP, gRPC, and metrics
+PORT_MAPPINGS=8080:80,50051:50051,9090:9090
+TARGET_HOST=10.0.0.5
 ```
 
 ## Proxy Modes
